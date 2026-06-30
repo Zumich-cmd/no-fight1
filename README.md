@@ -1,189 +1,81 @@
-# 🔥 Огонёк (No-Fight App)
+// functions/_lib/telegramAuth.js
+// Проверка подлинности initData от Telegram Mini App.
+// Использует Web Crypto API (crypto.subtle) — он стандартный и доступен
+// в среде Cloudflare Workers/Pages Functions без node-зависимостей.
+// Алгоритм: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 
-Telegram Mini App для пар: счётчик дней без ссор, общий на двоих.
+import { HttpError } from './store.js';
 
-Полностью на Cloudflare: статика на **Cloudflare Pages**, API на **Pages Functions**
-(это Cloudflare Workers под капотом), база данных — **Cloudflare D1** (serverless SQLite).
-Никакого отдельного сервера держать не нужно, всё на одном бесплатном тарифе Cloudflare.
+async function hmacSha256(keyBytes, message) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return new Uint8Array(signature);
+}
 
-## Что внутри
+function bytesToHex(bytes) {
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
-```
-no-fight-app/
-│
-├── client/                      ← статика, публикуется как Pages-сайт
-│   ├── index.html
-│   ├── style.css
-│   └── app.js
-│
-├── functions/                   ← API, выполняется как Pages Functions (Workers)
-│   ├── api/
-│   │   └── [[path]].js          ← единая точка входа для всех /api/*
-│   └── _lib/
-│       ├── telegramAuth.js      ← проверка подписи Telegram initData (Web Crypto)
-│       ├── store.js             ← запросы к D1: пользователи, пары
-│       ├── logic.js             ← чистые функции: даты, достижения, уровни
-│       └── pairLogic.js         ← обработчики: создать пару, ссора, примирение…
-│
-├── migrations/
-│   └── 0001_init.sql            ← схема базы для D1
-│
-├── wrangler.toml                ← конфиг Cloudflare (биндинг D1, переменные)
-├── .dev.vars.example            ← пример локальных переменных для разработки
-└── package.json
-```
+export async function validateInitData(initData, botToken) {
+  if (!initData || !botToken) return null;
 
-Папки `functions/_lib/*` не публикуются как маршруты — Cloudflare Pages Functions
-автоматически исключает из роутинга всё, что лежит в директориях с `_` в начале имени.
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) return null;
+  params.delete('hash');
 
-## Возможности
+  const entries = [...params.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join('\n');
 
-- 🔐 Авторизация через Telegram (проверка подписи `initData` через Web Crypto API)
-- 💌 Создание пары + код приглашения (6 символов)
-- 🔗 Подключение второго человека по коду — общий счётчик на двоих
-- ⏳ Таймер «без ссор уже N дней Ч ч М мин»
-- 😢 Кнопка «Мы поссорились» с выбором причины
-- ❤️ Кнопка «Помирились» — перезапускает таймер
-- 📅 Календарь месяца: зелёные/красные дни
-- 📝 Лента событий (история)
-- 🏆 Достижения: 7 / 30 / 100 / 365 дней без ссор
-- 🌱→👑 Уровень отношений по общему стажу пары
-- 📊 Статистика: вместе / без ссор / всего ссор / лучший рекорд
+  const secretKeyBytes = await hmacSha256(new TextEncoder().encode('WebAppData'), botToken);
+  const computedBytes = await hmacSha256(secretKeyBytes, dataCheckString);
+  const computedHex = bytesToHex(computedBytes);
 
-## Деплой на Cloudflare — пошагово
+  if (computedHex !== hash) return null;
 
-Понадобится `wrangler` (CLI Cloudflare) и аккаунт Cloudflare.
+  const userJson = params.get('user');
+  if (!userJson) return null;
+  try {
+    return JSON.parse(userJson);
+  } catch {
+    return null;
+  }
+}
 
-### 0. Установка
+// Достаёт пользователя из заголовка X-Telegram-Init-Data.
+// В режиме разработки (env.SKIP_TELEGRAM_AUTH === 'true') принимает пользователя
+// напрямую из заголовков X-Dev-Telegram-Id / X-Dev-Telegram-Name — это позволяет
+// тестировать приложение через `wrangler pages dev` в обычном браузере.
+export async function authenticate(request, env) {
+  const skipAuth = env.SKIP_TELEGRAM_AUTH === 'true';
+  const botToken = env.BOT_TOKEN;
+  const initData = request.headers.get('x-telegram-init-data');
 
-```bash
-npm install
-npx wrangler login
-```
+  if (initData && botToken) {
+    const user = await validateInitData(initData, botToken);
+    if (user) {
+      return {
+        id: String(user.id),
+        username: user.username || null,
+        first_name: user.first_name || null,
+      };
+    }
+    if (!skipAuth) {
+      throw new HttpError(401, 'invalid_telegram_signature');
+    }
+  }
 
-Откроется браузер — войдите в свой аккаунт Cloudflare и подтвердите доступ.
+  if (skipAuth) {
+    const devId = request.headers.get('x-dev-telegram-id') || 'dev-user-1';
+    const devName = request.headers.get('x-dev-telegram-name') || 'Тестовый пользователь';
+    return { id: String(devId), username: null, first_name: String(devName) };
+  }
 
-### 1. Создайте базу данных D1
-
-```bash
-npx wrangler d1 create no-fight-db
-```
-
-Команда выведет блок вида:
-
-```toml
-[[d1_databases]]
-binding = "DB"
-database_name = "no-fight-db"
-database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-Скопируйте `database_id` и вставьте его в `wrangler.toml` вместо
-`PASTE_DATABASE_ID_HERE`.
-
-### 2. Примените схему (миграцию)
-
-```bash
-npx wrangler d1 migrations apply no-fight-db --remote
-```
-
-`--remote` — применяет схему к реальной базе в облаке Cloudflare (а не к локальной
-тестовой копии). Для локальной разработки есть отдельная команда — см. ниже.
-
-### 3. Задайте секрет с токеном бота
-
-Токен от [@BotFather](https://t.me/BotFather) **не** кладите в `wrangler.toml` (он закоммитится
-в git как открытый текст) — задайте его отдельной командой, она хранит секрет в Cloudflare:
-
-```bash
-npx wrangler pages secret put BOT_TOKEN
-```
-
-Введёт запросит значение — вставьте токен бота.
-
-### 4. Выключите dev-режим для продакшена
-
-В `wrangler.toml` стоит `SKIP_TELEGRAM_AUTH = "true"` — это удобно для разработки
-(позволяет открыть приложение в обычном браузере без Telegram), но в проде подпись
-обязательно нужно проверять. Либо уберите эту переменную совсем, либо переопределите
-её на продакшен-окружении:
-
-```bash
-npx wrangler pages deployment env list   # посмотреть текущие переменные (опционально)
-```
-
-Самый простой путь — задать `SKIP_TELEGRAM_AUTH=false` как переменную окружения
-конкретно для production-ветки прямо в дашборде: **Pages → ваш проект → Settings →
-Environment variables → Production**.
-
-### 5. Задеплойте
-
-```bash
-npm run deploy
-```
-
-Это выполнит `wrangler pages deploy client` — опубликует статику из `client/` и
-автоматически подхватит `functions/` из корня проекта (так работает конвенция
-Pages Functions: они должны лежать в корне репозитория, не внутри output-папки).
-
-Если у вас уже есть существующий Pages-проект (тот, что вы создавали раньше через
-дашборд / drag-and-drop) — деплой через `wrangler pages deploy client` обновит именно
-его, если имя проекта (`name` в `wrangler.toml`) совпадает с именем существующего
-проекта в дашборде. Проверьте/поправьте `name = "no-fight-app"` в `wrangler.toml`
-под реальное имя вашего проекта в Cloudflare, если оно другое.
-
-### 6. Привяжите D1 к проекту в дашборде (если деплоили раньше без wrangler.toml)
-
-Если до этого вы заливали проект просто перетаскиванием файлов в дашборд (без
-`wrangler.toml`), биндинг D1 нужно подключить руками: **Pages → ваш проект →
-Settings → Functions → D1 database bindings → Add binding**, имя переменной — `DB`,
-база — `no-fight-db`. После этого нужен новый деплой, чтобы биндинг применился.
-
-### 7. Укажите URL в @BotFather
-
-`/setmenubutton` → выберите бота → укажите `https://ваш-проект.pages.dev` (или ваш
-кастомный домен) — это и есть точка входа в Mini App.
-
-## Локальная разработка
-
-```bash
-cp .dev.vars.example .dev.vars
-npm run db:migrate:local      # применяет схему к локальной копии D1 (файл на диске)
-npm run dev                   # wrangler pages dev — поднимет сайт + API локально
-```
-
-Откройте адрес, который выведет Wrangler (обычно `http://localhost:8788`). Работает
-без Telegram — каждый браузер получает свой dev-аккаунт автоматически.
-
-## API (кратко)
-
-| Метод | Путь                  | Описание                                  |
-|-------|------------------------|--------------------------------------------|
-| GET   | /api/me                | текущий пользователь                       |
-| POST  | /api/pair/create        | создать пару, вернуть код приглашения      |
-| POST  | /api/pair/join          | войти по коду `{ code }`                   |
-| GET   | /api/pair/state         | состояние пары: таймер, статистика, уровень|
-| POST  | /api/pair/fight         | зафиксировать ссору `{ reason }`           |
-| POST  | /api/pair/reconcile     | помирились — таймер обнуляется             |
-| GET   | /api/pair/history       | лента событий                              |
-| GET   | /api/pair/calendar      | дни ссор за месяц `?month=YYYY-MM`         |
-| POST  | /api/pair/leave         | покинуть пару                              |
-
-Фронтенд и API теперь на одном домене (Cloudflare Pages), поэтому CORS не нужен —
-запросы идут на тот же origin, что и сама страница.
-
-## Дальнейшее развитие
-
-- Push-напоминания вечером — потребуется Cloudflare Cron Triggers (выполняются как
-  отдельный Worker по расписанию) + Telegram Bot API для отправки сообщений
-- Платные темы оформления, виджет на главный экран
-- Экспорт статистики
-- Персональные (не только парные) достижения
-
-## Известные ограничения
-
-- Напоминания (push) не реализованы — см. «Дальнейшее развитие»
-- Пара ограничена двумя участниками (как и задумано)
-- D1 — это SQLite, реплицируемый по edge-сети Cloudflare; для очень высоких нагрузок
-  или сложных транзакций в будущем можно рассмотреть Cloudflare D1 + Durable Objects
-  или внешний Postgres (например, Neon/Supabase), но для MVP пары D1 более чем достаточно
+  throw new HttpError(401, 'missing_telegram_auth');
+}
