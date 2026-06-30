@@ -1,0 +1,22 @@
+name = "no-fight-app"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+
+# Статика (client/) отдаётся прямо из Worker'а через биндинг ASSETS —
+# см. src/worker.js: всё, что не начинается с /api/, уходит в env.ASSETS.fetch().
+[assets]
+directory = "./client"
+binding = "ASSETS"
+
+# Биндинг базы данных D1. database_id появится после команды
+# `wrangler d1 create no-fight-db` — впишите его сюда (см. README → Деплой).
+[[d1_databases]]
+binding = "DB"
+database_name = "no-fight-db"
+database_id = "PASTE_DATABASE_ID_HERE"
+
+# Переменные окружения. BOT_TOKEN сюда НЕ кладём — это секрет, его задаём
+# отдельной командой `wrangler secret put BOT_TOKEN`, чтобы он не попал
+# в git и не светился в дашборде как обычный текст.
+[vars]
+SKIP_TELEGRAM_AUTH = "true"
